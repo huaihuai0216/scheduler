@@ -1,0 +1,22 @@
+/* Tailwind v4：任一種都可，擇一保留 */
+/* 方式 A： */
+@import "tailwindcss";
+/* 方式 B： */
+/* @tailwind base;
+@tailwind components;
+@tailwind utilities; */
+
+/* Reset & 基本外觀：避免 Vite 範例的深色主題/置中干擾 */
+:root { color-scheme: light; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  /* 建議用 Tailwind class 控外觀，但這裡保留最基本背景與字色 */
+  background: #f8fafc; /* slate-50 */
+  color: #0f172a;      /* slate-900 */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans TC", "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+/* 讓 PDF 截圖時字距更穩定 */
+* { letter-spacing: .02em; }
+.tabular-nums { font-variant-numeric: tabular-nums; }
