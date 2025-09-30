@@ -79,7 +79,104 @@ const TEMPLATES = {
 };
 
 function defaultNames(n, prefix) {
-  return range(n).map((i) => ({ id: `${prefix}-${i + 1}`, name: `${prefix}${i + 1}`, marks: {} }));
+  return range(n).map((i) => ({ 
+    id: `${prefix}-${i + 1}`, 
+    name: `${prefix}${i + 1}`, 
+    marks: {},
+    staffType: 'general', // 'manager' | 'general'
+    score: 1 // 1-2分
+  }));
+}
+
+// 班別類型識別函數
+function getShiftType(shift) {
+  const startTime = clockToMinutes(shift.start);
+  const endTime = clockToMinutes(shift.end);
+  const hours = shift.hours || 0;
+  
+  // 早班：09:00上班且上班時長為6或8小時
+  if (startTime === clockToMinutes("09:00") && (hours === 6 || hours === 8)) {
+    return 'morning';
+  }
+  
+  // 晚班：22:00下班且上班時長為6或8小時
+  if (endTime === clockToMinutes("22:00") && (hours === 6 || hours === 8)) {
+    return 'evening';
+  }
+  
+  // 全班：上班時長達10小時
+  if (hours >= 10) {
+    return 'full';
+  }
+  
+  return 'other';
+}
+
+// 計算個人班別統計
+function calculateShiftStats(schedule, allPeople) {
+  const stats = new Map();
+  
+  // 初始化統計
+  allPeople.forEach(person => {
+    stats.set(person.id, {
+      id: person.id,
+      name: person.name,
+      role: person.role || '',
+      morning: 0,
+      evening: 0,
+      full: 0,
+      other: 0
+    });
+  });
+  
+  // 統計各日班別
+  schedule.days.forEach(day => {
+    const allShifts = [...day.pharmacists, ...day.clerks];
+    allShifts.forEach(shift => {
+      const stat = stats.get(shift.id);
+      if (stat) {
+        const shiftType = getShiftType(shift);
+        stat[shiftType]++;
+      }
+    });
+  });
+  
+  return Array.from(stats.values());
+}
+
+// 檢查某個時段是否有當班主管
+function hasManagerAtHour(dayShifts, allPeople, hour) {
+  const hourMinutes = clockToMinutes(hour);
+  
+  for (const shift of dayShifts) {
+    const person = allPeople.find(p => p.id === shift.id);
+    if (person && person.staffType === 'manager') {
+      const startMinutes = clockToMinutes(shift.start);
+      const endMinutes = clockToMinutes(shift.end);
+      if (startMinutes <= hourMinutes && hourMinutes < endMinutes) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// 計算某個時段的人力總分數
+function calculateHourlyScore(dayShifts, allPeople, hour) {
+  const hourMinutes = clockToMinutes(hour);
+  let totalScore = 0;
+  
+  for (const shift of dayShifts) {
+    const person = allPeople.find(p => p.id === shift.id);
+    if (person) {
+      const startMinutes = clockToMinutes(shift.start);
+      const endMinutes = clockToMinutes(shift.end);
+      if (startMinutes <= hourMinutes && hourMinutes < endMinutes) {
+        totalScore += person.score || 1;
+      }
+    }
+  }
+  return totalScore;
 }
 
 // === 合併連續班（同人）並保留工時 ===
@@ -129,7 +226,7 @@ function formatEntryForDisplay(entry) {
 }
 
 // --- Core scheduling ---
-function buildSchedule({ startDate, pharmacists, clerks }) {
+function buildSchedule({ startDate, pharmacists, clerks, hourlyRequirements = {} }) {
   const days = range(28).map((i) => addDays(startDate, i));
 
   const result = days.map((date) => ({
@@ -143,11 +240,80 @@ function buildSchedule({ startDate, pharmacists, clerks }) {
   const load = new Map(); // id -> total hours
   const addLoad = (id, h) => load.set(id, (load.get(id) || 0) + h);
 
-  const pick = (staffList, hoursNeeded, dateStr) => {
+  // 班別計數器
+  const shiftCounts = new Map(); // id -> {morning: 0, evening: 0, full: 0}
+  const initShiftCount = (id) => {
+    if (!shiftCounts.has(id)) {
+      shiftCounts.set(id, { morning: 0, evening: 0, full: 0 });
+    }
+  };
+  
+  const addShiftCount = (id, type) => {
+    initShiftCount(id);
+    const counts = shiftCounts.get(id);
+    counts[type]++;
+  };
+
+  // 檢查某人前一天是否為晚班
+  const hadEveningShiftYesterday = (personId, currentDateIndex) => {
+    if (currentDateIndex === 0) return false;
+    const yesterday = result[currentDateIndex - 1];
+    const yesterdayShifts = [...yesterday.pharmacists, ...yesterday.clerks];
+    
+    for (const shift of yesterdayShifts) {
+      if (shift.id === personId && getShiftType(shift) === 'evening') {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const pick = (staffList, hoursNeeded, dateStr, preferredShiftType = null, currentDateIndex = 0) => {
     // 可上班：沒有任何標記（MARK.NONE）者
     const avail = staffList.filter((p) => getMark(p, dateStr).type === MARK.NONE);
     if (avail.length === 0) return null;
-    avail.sort((a, b) => (load.get(a.id) || 0) - (load.get(b.id) || 0));
+    
+    // 初始化班別計數
+    avail.forEach(p => initShiftCount(p.id));
+    
+    // 排序邏輯：先考慮班別公平，再考慮工時平衡
+    avail.sort((a, b) => {
+      const aLoad = load.get(a.id) || 0;
+      const bLoad = load.get(b.id) || 0;
+      const aCounts = shiftCounts.get(a.id);
+      const bCounts = shiftCounts.get(b.id);
+      
+      // 避免連續晚早班（優先度較低，在其他條件相近時才考慮）
+      if (preferredShiftType === 'morning') {
+        const aHadEvening = hadEveningShiftYesterday(a.id, currentDateIndex);
+        const bHadEvening = hadEveningShiftYesterday(b.id, currentDateIndex);
+        
+        // 如果其他條件相近，優先選擇昨天非晚班的人
+        if (aHadEvening !== bHadEvening) {
+          const otherFactorsEqual = Math.abs(aLoad - bLoad) <= 2 && 
+                                  Math.abs((aCounts.morning + aCounts.evening) - (bCounts.morning + bCounts.evening)) <= 1;
+          if (otherFactorsEqual) {
+            return aHadEvening ? 1 : -1;
+          }
+        }
+      }
+      
+      // 如有指定班別類型，優先選擇該班別次數較少的人
+      if (preferredShiftType && preferredShiftType !== 'other') {
+        const aDiff = aCounts[preferredShiftType] - bCounts[preferredShiftType];
+        if (aDiff !== 0) return aDiff;
+      }
+      
+      // 早晚班平衡：選擇早晚班總數較少的人
+      const aMorningEvening = aCounts.morning + aCounts.evening;
+      const bMorningEvening = bCounts.morning + bCounts.evening;
+      const balanceDiff = aMorningEvening - bMorningEvening;
+      if (balanceDiff !== 0) return balanceDiff;
+      
+      // 最後考慮工時平衡
+      return aLoad - bLoad;
+    });
+    
     const chosen = avail[0];
     addLoad(chosen.id, hoursNeeded);
     return chosen;
@@ -168,7 +334,8 @@ function buildSchedule({ startDate, pharmacists, clerks }) {
     }
   }
 
-  for (const day of result) {
+  for (let dayIndex = 0; dayIndex < result.length; dayIndex++) {
+    const day = result[dayIndex];
     const dateStr = fmt(day.date);
 
     // === 規則新增：若某組人數為 2 且兩人都可上班，則兩人必上 ===
@@ -177,29 +344,69 @@ function buildSchedule({ startDate, pharmacists, clerks }) {
 
     // Pharmacists
     if (pharmacists.length === 2 && pAvail.length === 2) {
-      // 兩人必上，各排 6h 區段以避免 12h
-      const sorted = [...pAvail].sort((a, b) => (load.get(a.id) || 0) - (load.get(b.id) || 0));
+      // 兩人必上，各排 6h 區段以避免 12h，考慮早晚班平衡
+      pAvail.forEach(p => initShiftCount(p.id));
+      const sorted = [...pAvail].sort((a, b) => {
+        const aLoad = load.get(a.id) || 0;
+        const bLoad = load.get(b.id) || 0;
+        const aCounts = shiftCounts.get(a.id);
+        const bCounts = shiftCounts.get(b.id);
+        
+        // 早晚班平衡優先
+        const aMorningEvening = aCounts.morning + aCounts.evening;
+        const bMorningEvening = bCounts.morning + bCounts.evening;
+        const balanceDiff = aMorningEvening - bMorningEvening;
+        if (balanceDiff !== 0) return balanceDiff;
+        
+        return aLoad - bLoad;
+      });
+      
       const pA = sorted[0], pB = sorted[1];
-      day.pharmacists.push({ id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A }); addLoad(pA.id, 6);
-      day.pharmacists.push({ id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B }); addLoad(pB.id, 6);
+      const aShift = { id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A };
+      const bShift = { id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B };
+      
+      day.pharmacists.push(aShift); 
+      day.pharmacists.push(bShift);
+      addLoad(pA.id, 6);
+      addLoad(pB.id, 6);
+      addShiftCount(pA.id, getShiftType(aShift));
+      addShiftCount(pB.id, getShiftType(bShift));
     } else {
       // 原有策略：同組全員可上（且≥2）則避免 12h
       const avoidP12 = pAvail.length === pharmacists.length && pAvail.length >= 2;
       if (!avoidP12) {
-        const pCandidate = pick(pharmacists, 12, dateStr);
+        const pCandidate = pick(pharmacists, 12, dateStr, 'full', dayIndex);
         if (pCandidate) {
-          day.pharmacists.push({ id: pCandidate.id, name: pCandidate.name, ...TEMPLATES.pharmacist.P12 });
+          const shift = { id: pCandidate.id, name: pCandidate.name, ...TEMPLATES.pharmacist.P12 };
+          day.pharmacists.push(shift);
+          addShiftCount(pCandidate.id, getShiftType(shift));
         } else {
-          const pA = pick(pharmacists, 6, dateStr);
-          const pB = pick(pharmacists, 6, dateStr);
-          if (pA) day.pharmacists.push({ id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A });
-          if (pB) day.pharmacists.push({ id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B });
+          const pA = pick(pharmacists, 6, dateStr, 'morning', dayIndex);
+          const pB = pick(pharmacists, 6, dateStr, 'evening', dayIndex);
+          if (pA) {
+            const shiftA = { id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A };
+            day.pharmacists.push(shiftA);
+            addShiftCount(pA.id, getShiftType(shiftA));
+          }
+          if (pB) {
+            const shiftB = { id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B };
+            day.pharmacists.push(shiftB);
+            addShiftCount(pB.id, getShiftType(shiftB));
+          }
         }
       } else {
-        const pA = pick(pharmacists, 6, dateStr);
-        const pB = pick(pharmacists, 6, dateStr);
-        if (pA) day.pharmacists.push({ id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A });
-        if (pB) day.pharmacists.push({ id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B });
+        const pA = pick(pharmacists, 6, dateStr, 'morning', dayIndex);
+        const pB = pick(pharmacists, 6, dateStr, 'evening', dayIndex);
+        if (pA) {
+          const shiftA = { id: pA.id, name: pA.name, ...TEMPLATES.pharmacist.P6A };
+          day.pharmacists.push(shiftA);
+          addShiftCount(pA.id, getShiftType(shiftA));
+        }
+        if (pB) {
+          const shiftB = { id: pB.id, name: pB.name, ...TEMPLATES.pharmacist.P6B };
+          day.pharmacists.push(shiftB);
+          addShiftCount(pB.id, getShiftType(shiftB));
+        }
       }
     }
     if (!ensuresCoverage(day.pharmacists, "09:00", "21:00")) {
@@ -208,26 +415,83 @@ function buildSchedule({ startDate, pharmacists, clerks }) {
 
     // Clerks
     if (clerks.length === 2 && cAvail.length === 2) {
-      const sorted = [...cAvail].sort((a, b) => (load.get(a.id) || 0) - (load.get(b.id) || 0));
+      cAvail.forEach(c => initShiftCount(c.id));
+      const sorted = [...cAvail].sort((a, b) => {
+        const aLoad = load.get(a.id) || 0;
+        const bLoad = load.get(b.id) || 0;
+        const aCounts = shiftCounts.get(a.id);
+        const bCounts = shiftCounts.get(b.id);
+        
+        // 早晚班平衡優先
+        const aMorningEvening = aCounts.morning + aCounts.evening;
+        const bMorningEvening = bCounts.morning + bCounts.evening;
+        const balanceDiff = aMorningEvening - bMorningEvening;
+        if (balanceDiff !== 0) return balanceDiff;
+        
+        return aLoad - bLoad;
+      });
+      
       const cA = sorted[0], cB = sorted[1];
-      day.clerks.push({ id: cA.id, name: cA.name, ...TEMPLATES.clerk.S6A }); addLoad(cA.id, 6);
-      day.clerks.push({ id: cB.id, name: cB.name, ...TEMPLATES.clerk.S6B }); addLoad(cB.id, 6);
+      const aShift = { id: cA.id, name: cA.name, ...TEMPLATES.clerk.S6A };
+      const bShift = { id: cB.id, name: cB.name, ...TEMPLATES.clerk.S6B };
+      
+      day.clerks.push(aShift);
+      day.clerks.push(bShift);
+      addLoad(cA.id, 6);
+      addLoad(cB.id, 6);
+      addShiftCount(cA.id, getShiftType(aShift));
+      addShiftCount(cB.id, getShiftType(bShift));
     } else {
       const avoidC12 = cAvail.length === clerks.length && cAvail.length >= 2;
-      const cA = pick(clerks, 6, dateStr);
-      const cB = pick(clerks, 6, dateStr);
-      if (cA) day.clerks.push({ id: cA.id, name: cA.name, ...TEMPLATES.clerk.S6A });
-      if (cB) day.clerks.push({ id: cB.id, name: cB.name, ...TEMPLATES.clerk.S6B });
+      const cA = pick(clerks, 6, dateStr, 'morning', dayIndex);
+      const cB = pick(clerks, 6, dateStr, 'evening', dayIndex);
+      if (cA) {
+        const shiftA = { id: cA.id, name: cA.name, ...TEMPLATES.clerk.S6A };
+        day.clerks.push(shiftA);
+        addShiftCount(cA.id, getShiftType(shiftA));
+      }
+      if (cB) {
+        const shiftB = { id: cB.id, name: cB.name, ...TEMPLATES.clerk.S6B };
+        day.clerks.push(shiftB);
+        addShiftCount(cB.id, getShiftType(shiftB));
+      }
       if (!ensuresCoverage(day.clerks, "09:00", "22:00")) {
         if (!avoidC12) {
           day.clerks = [];
-          const c12 = pick(clerks, 12, dateStr);
-          if (c12) day.clerks.push({ id: c12.id, name: c12.name, ...TEMPLATES.clerk.S12 });
+          const c12 = pick(clerks, 12, dateStr, 'full', dayIndex);
+          if (c12) {
+            const shift12 = { id: c12.id, name: c12.name, ...TEMPLATES.clerk.S12 };
+            day.clerks.push(shift12);
+            addShiftCount(c12.id, getShiftType(shift12));
+          }
         }
       }
     }
     if (!ensuresCoverage(day.clerks, "09:00", "22:00")) {
       day.warnings.push("門市人力不足，09:00-22:00 覆蓋未完整。");
+    }
+
+    // 檢查營業時間是否有當班主管 (09:00-22:00)
+    const allPeople = [...pharmacists, ...clerks];
+    const allDayShifts = [...day.pharmacists, ...day.clerks];
+    const businessHours = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"];
+    
+    for (const hour of businessHours) {
+      if (!hasManagerAtHour(allDayShifts, allPeople, hour)) {
+        day.warnings.push(`${hour} 時段缺少當班主管。`);
+        break; // 只提示一次避免過多警告
+      }
+    }
+
+    // 檢查各時段人力分數是否達標
+    for (const hour of businessHours) {
+      const requiredScore = hourlyRequirements[hour];
+      if (requiredScore) {
+        const actualScore = calculateHourlyScore(allDayShifts, allPeople, hour);
+        if (actualScore < requiredScore) {
+          day.warnings.push(`${hour} 時段人力分數不足：需要${requiredScore}分，實際${actualScore}分。`);
+        }
+      }
     }
   }
 
@@ -267,7 +531,14 @@ function buildSchedule({ startDate, pharmacists, clerks }) {
     }
   }
 
-  return { days: result, stats: Array.from(stats.values()) };
+  // 計算班別統計
+  const allPeople = [
+    ...pharmacists.map(p => ({ ...p, role: '藥師' })),
+    ...clerks.map(p => ({ ...p, role: '門市' }))
+  ];
+  const shiftStats = calculateShiftStats({ days: result }, allPeople);
+
+  return { days: result, stats: Array.from(stats.values()), shiftStats };
 }
 
 // === 單一表格的「休假/支援」編輯器（橫軸：所有人員；縱軸：日期） ===
@@ -319,6 +590,20 @@ function PeopleEditorCombined({ pharmacists, setPharmacists, clerks, setClerks, 
     });
   };
 
+  const updateStaffType = (person, staffType) => {
+    apply(person.group, (arr) => {
+      arr[person.idx] = { ...arr[person.idx], staffType };
+      return arr;
+    });
+  };
+
+  const updateScore = (person, score) => {
+    apply(person.group, (arr) => {
+      arr[person.idx] = { ...arr[person.idx], score };
+      return arr;
+    });
+  };
+
   const badge = (t) => {
     switch (t) {
       case MARK.OFF: return { txt: '休', cls: 'bg-rose-50 border-rose-200 text-rose-700' };
@@ -343,13 +628,31 @@ function PeopleEditorCombined({ pharmacists, setPharmacists, clerks, setClerks, 
             <tr>
               <th className="sticky left-0 bg-white border-b p-2 text-sm w-28">日期</th>
               {people.map((p) => (
-                <th key={p.id} className="border-b p-2 text-sm min-w-[150px] text-left">
+                <th key={p.id} className="border-b p-2 text-sm min-w-[180px] text-left">
                   <div className="text-[11px] text-gray-500 mb-1">{p.role}</div>
                   <input
-                    className="border rounded px-2 py-1 w-full text-sm"
+                    className="border rounded px-2 py-1 w-full text-sm mb-1"
                     value={p.name}
                     onChange={(e) => rename(p, e.target.value)}
                   />
+                  <div className="flex gap-1 text-xs">
+                    <select
+                      className="border rounded px-1 py-0.5 text-xs flex-1"
+                      value={p.staffType || 'general'}
+                      onChange={(e) => updateStaffType(p, e.target.value)}
+                    >
+                      <option value="manager">當班主管</option>
+                      <option value="general">一般人力</option>
+                    </select>
+                    <select
+                      className="border rounded px-1 py-0.5 text-xs w-12"
+                      value={p.score || 1}
+                      onChange={(e) => updateScore(p, Number(e.target.value))}
+                    >
+                      <option value="1">1分</option>
+                      <option value="2">2分</option>
+                    </select>
+                  </div>
                 </th>
               ))}
             </tr>
@@ -509,9 +812,9 @@ function ScheduleMatrix({ schedule, pharmacists, clerks, expectedHours }) {
                 </tr>
               );
             })}
-            {/* 合併總計行（置於最下方） */}
+            {/* 工時總計行 */}
             <tr>
-              <td className="sticky left-0 bg-white border-t p-2 text-sm font-medium">合計 / 差額</td>
+              <td className="sticky left-0 bg-white border-t p-2 text-sm font-medium">工時合計</td>
               {people.map((p) => {
                 // 直接將「上班時數」逐日加總（不含加班）
                 const totals = days.reduce((acc, d) => {
@@ -530,11 +833,39 @@ function ScheduleMatrix({ schedule, pharmacists, clerks, expectedHours }) {
                 );
               })}
             </tr>
+            {/* 班別統計行 */}
+            <tr>
+              <td className="sticky left-0 bg-white border-t p-2 text-sm font-medium">班別統計</td>
+              {people.map((p) => {
+                const stat = (schedule.shiftStats || []).find(s => s.id === p.id);
+                const shiftInfo = stat 
+                  ? `早${stat.morning}晚${stat.evening}全${stat.full}` 
+                  : '早0晚0全0';
+                return (
+                  <React.Fragment key={p.id+"-shifts"}>
+                    <td className="border-t p-2 text-left tabular-nums text-xs">{shiftInfo}</td>
+                    <td className="border-t p-2 text-right tabular-nums text-xs">{p.staffType === 'manager' ? '主管' : '一般'}</td>
+                    <td className="border-t p-2 text-right tabular-nums text-xs">{p.score || 1}分</td>
+                  </React.Fragment>
+                );
+              })}
+            </tr>
           </tbody>
         </table>
       </div>
     </div>
   );
+
+  // 收集所有警告
+  const allWarnings = days.reduce((acc, day) => {
+    if (day.warnings && day.warnings.length > 0) {
+      acc.push({
+        date: `${day.date.getMonth()+1}/${day.date.getDate()}`,
+        warnings: day.warnings
+      });
+    }
+    return acc;
+  }, []);
 
   return (
     <div className="mt-6">
@@ -542,6 +873,22 @@ function ScheduleMatrix({ schedule, pharmacists, clerks, expectedHours }) {
         <h3 className="text-lg font-semibold">產生的班表（橫軸：人員；縱軸：日期）</h3>
         <button onClick={dlPdf} className="px-3 py-1.5 rounded-lg border shadow-sm text-sm">匯出 PDF</button>
       </div>
+      
+      {/* 警告提示 */}
+      {allWarnings.length > 0 && (
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+          <h4 className="text-sm font-medium text-amber-800 mb-2">排班警告</h4>
+          <div className="text-sm text-amber-700 space-y-1">
+            {allWarnings.map((item, index) => (
+              <div key={index}>
+                <span className="font-medium">{item.date}：</span>
+                {item.warnings.join('；')}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      
       <div ref={containerRef}>
         {renderMatrix()}
       </div>
@@ -567,6 +914,12 @@ export default function SchedulerApp() {
 
   const [expectedHours, setExpectedHours] = useState(160); // 新增：每人應上時數
 
+  // 時段人力分數需求設定
+  const [hourlyRequirements, setHourlyRequirements] = useState({
+    "09:00": 2, "10:00": 2, "11:00": 2, "12:00": 3, "13:00": 3, "14:00": 3,
+    "15:00": 3, "16:00": 3, "17:00": 3, "18:00": 3, "19:00": 3, "20:00": 3, "21:00": 2
+  });
+
   const [pharmacists, setPharmacists] = useState(() => defaultNames(pCount, "藥師"));
   const [clerks, setClerks] = useState(() => defaultNames(cCount, "門市"));
 
@@ -588,7 +941,7 @@ export default function SchedulerApp() {
   const [schedule, setSchedule] = useState(null);
 
   const generate = () => {
-    const data = buildSchedule({ startDate, pharmacists, clerks });
+    const data = buildSchedule({ startDate, pharmacists, clerks, hourlyRequirements });
     setSchedule(data);
   };
 
@@ -655,13 +1008,35 @@ export default function SchedulerApp() {
 
               <button onClick={generate} className="w-full mt-2 px-4 py-2 rounded-xl bg-black text-white font-medium shadow">產生班表</button>
 
-              <div className="text-xs text-gray-500">
+              <div className="mt-4">
+                <label className="block text-sm text-gray-700 mb-2">各時段人力分數需求</label>
+                <div className="grid grid-cols-3 gap-1 text-xs">
+                  {Object.entries(hourlyRequirements).map(([hour, score]) => (
+                    <div key={hour} className="flex items-center gap-1">
+                      <span className="w-12">{hour}</span>
+                      <input
+                        type="number" min={1} max={10} step={1}
+                        className="border rounded px-1 py-0.5 w-12 text-xs"
+                        value={score}
+                        onChange={(e) => setHourlyRequirements(prev => ({
+                          ...prev,
+                          [hour]: Number(e.target.value || 1)
+                        }))}
+                      />
+                      <span>分</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="text-xs text-gray-500 mt-4">
                 生成邏輯：
                 <ul className="list-disc ml-5 mt-1 space-y-1">
+                  <li>早晚班公平分配：早班(09:00上班6-8h)、晚班(22:00下班6-8h)、全班(10h+)。</li>
+                  <li>避免連續晚早班：22:00下班後隔天盡量不排09:00上班。</li>
+                  <li>營業時間需至少一位當班主管，各時段需達設定人力分數。</li>
                   <li>若同組人數 = 2 且兩人皆可上班，則兩人必上（各 6h 段）。</li>
-                  <li>同組全員可上（且≥2）時避免 12h；人力不足才用 12h 補位。</li>
                   <li>可標記：休 / 公 / 特 / 補 / 支；「公/特/補/支」不算本店人力，但會計入個人工時。</li>
-                  <li>自動註記休息：&gt;6h 休0.5；&gt;10h 休1.0（休息不計入工時）。當日工時 &gt; 10h 的超出顯示為「加x」。</li>
                 </ul>
               </div>
             </div>
