@@ -618,8 +618,14 @@ function PeopleEditorCombined({ pharmacists, setPharmacists, clerks, setClerks, 
   return (
     <div className="border rounded-2xl p-4 shadow-sm bg-white">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-lg font-semibold">休假/支援設定（橫軸：人員；縱軸：日期）</h3>
-        <div className="text-sm text-gray-500">點格子循環：班 → 休 → 公 → 特 → 補 → 支（公/特/補/支可填時數）</div>
+        <div>
+          <h3 className="text-lg font-semibold">休假/支援設定</h3>
+          <div className="text-sm text-gray-500">（橫軸：人員；縱軸：日期）</div>
+        </div>
+        <div className="text-sm text-gray-500 text-right">
+          <div>點格子循環：班 → 休 → 公 → 特 → 補 → 支</div>
+          <div>（公/特/補/支可填時數）</div>
+        </div>
       </div>
 
       <div className="overflow-auto">
